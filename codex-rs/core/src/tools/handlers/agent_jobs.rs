@@ -311,7 +311,10 @@ mod spawn_agents_on_csv {
         let job_name = args
             .job_name
             .unwrap_or_else(|| format!("agent-job-{job_suffix}"));
-        let max_runtime_seconds = normalize_max_runtime_seconds(args.max_runtime_seconds)?;
+        let max_runtime_seconds = normalize_max_runtime_seconds(
+            args.max_runtime_seconds
+                .or(turn.config.agent_job_max_runtime_seconds),
+        )?;
         let _job = db
             .create_agent_job(
                 &codex_state::AgentJobCreateParams {
