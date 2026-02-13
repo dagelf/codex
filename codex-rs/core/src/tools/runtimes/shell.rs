@@ -174,7 +174,7 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
                 .session
                 .services
                 .zsh_sidecar_manager
-                .execute_shell_request(&sidecar_req, attempt, Self::stdout_stream(ctx))
+                .execute_shell_request(&sidecar_req, ctx.session, ctx.turn, &ctx.call_id)
                 .await;
         }
 
