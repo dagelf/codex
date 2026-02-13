@@ -1,12 +1,13 @@
 #![allow(dead_code)]
 
+use crate::error::CodexErr;
+use crate::error::SandboxErr;
 use crate::exec::ExecToolCallOutput;
 use crate::protocol::EventMsg;
 use crate::protocol::ExecCommandOutputDeltaEvent;
 use crate::protocol::ExecOutputStream;
 use crate::protocol::ReviewDecision;
 use crate::protocol::TerminalInteractionEvent;
-use crate::sandboxing::SandboxPermissions;
 use crate::tools::sandboxing::ToolError;
 use crate::zsh_sidecar::protocol::ApprovalDecision;
 use crate::zsh_sidecar::protocol::EmptyResult;
@@ -32,10 +33,9 @@ use crate::zsh_sidecar::protocol::METHOD_ZSH_REQUEST_APPROVAL;
 use crate::zsh_sidecar::protocol::RequestApprovalParams;
 use crate::zsh_sidecar::protocol::RequestApprovalResult;
 use base64::Engine as _;
-use codex_network_proxy::NetworkProxy;
 use codex_protocol::approvals::ExecPolicyAmendment;
 use serde_json::Value as JsonValue;
-use std::collections::HashMap;
+use std::env;
 use std::path::PathBuf;
 use std::time::Instant;
 use tokio::io::AsyncBufReadExt;
@@ -57,17 +57,6 @@ pub(crate) struct ZshSidecarManager {
     zsh_path: Option<PathBuf>,
     codex_home: Option<PathBuf>,
     state: Mutex<ZshSidecarState>,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct ZshSidecarExecRequest {
-    pub(crate) command: Vec<String>,
-    pub(crate) cwd: PathBuf,
-    pub(crate) timeout_ms: Option<u64>,
-    pub(crate) env: HashMap<String, String>,
-    pub(crate) network: Option<NetworkProxy>,
-    pub(crate) sandbox_permissions: SandboxPermissions,
-    pub(crate) justification: Option<String>,
 }
 
 impl ZshSidecarManager {
@@ -99,11 +88,12 @@ impl ZshSidecarManager {
 
     pub(crate) async fn execute_shell_request(
         &self,
-        req: &ZshSidecarExecRequest,
+        req: &crate::sandboxing::ExecRequest,
         session: &crate::codex::Session,
         turn: &crate::codex::TurnContext,
         call_id: &str,
     ) -> Result<ExecToolCallOutput, ToolError> {
+        let sidecar_path = self.resolve_sidecar_path()?;
         let zsh_path = self.zsh_path.clone().ok_or_else(|| {
             ToolError::Rejected(
                 "shell_zsh_fork enabled, but zsh_path is not configured".to_string(),
@@ -122,7 +112,9 @@ impl ZshSidecarManager {
             return Err(ToolError::Rejected("command args are empty".to_string()));
         }
 
-        let mut child = tokio::process::Command::new(&zsh_path)
+        let mut child = tokio::process::Command::new(&sidecar_path)
+            .arg("--zsh-path")
+            .arg(&zsh_path)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -131,7 +123,7 @@ impl ZshSidecarManager {
             .map_err(|err| {
                 ToolError::Rejected(format!(
                     "failed to start zsh sidecar `{}`: {err}",
-                    zsh_path.display()
+                    sidecar_path.display()
                 ))
             })?;
 
@@ -252,6 +244,26 @@ impl ZshSidecarManager {
             duration: start.elapsed(),
             timed_out: exited.timed_out.unwrap_or(false),
         })
+        .and_then(|output| Self::map_exec_result(req.sandbox, output))
+    }
+
+    fn map_exec_result(
+        sandbox: crate::exec::SandboxType,
+        output: ExecToolCallOutput,
+    ) -> Result<ExecToolCallOutput, ToolError> {
+        if output.timed_out {
+            return Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Timeout {
+                output: Box::new(output),
+            })));
+        }
+
+        if crate::exec::is_likely_sandbox_denied(sandbox, &output) {
+            return Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Denied {
+                output: Box::new(output),
+            })));
+        }
+
+        Ok(output)
     }
 
     async fn wait_for_response<T: serde::de::DeserializeOwned>(
@@ -513,6 +525,20 @@ impl ZshSidecarManager {
             ReviewDecision::Denied => ApprovalDecision::Denied,
             ReviewDecision::Abort => ApprovalDecision::Abort,
         }
+    }
+
+    fn resolve_sidecar_path(&self) -> Result<PathBuf, ToolError> {
+        if let Ok(path) = env::var("CODEX_ZSH_SIDECAR_PATH")
+            && !path.trim().is_empty()
+        {
+            return Ok(PathBuf::from(path));
+        }
+
+        which::which("codex-zsh-sidecar").map_err(|err| {
+            ToolError::Rejected(format!(
+                "unable to locate `codex-zsh-sidecar` in PATH; set CODEX_ZSH_SIDECAR_PATH. resolution error: {err}"
+            ))
+        })
     }
 }
 
