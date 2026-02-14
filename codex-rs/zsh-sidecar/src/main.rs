@@ -7,13 +7,18 @@ use serde::Serialize;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::process::Stdio;
-use std::sync::Arc;
 use tokio::io::AsyncBufReadExt;
-use tokio::io::AsyncReadExt;
+use tokio::io::AsyncReadExt as _;
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
-use tokio::process::Child;
-use tokio::sync::Mutex;
+#[cfg(unix)]
+use tokio::net::UnixListener;
+#[cfg(unix)]
+use tokio::net::UnixStream;
+use tokio::process::Command;
+use tokio::sync::mpsc;
+use tokio::task::JoinSet;
+use uuid::Uuid;
 
 const JSONRPC_VERSION: &str = "2.0";
 const METHOD_ZSH_INITIALIZE: &str = "zsh/initialize";
@@ -27,6 +32,9 @@ const METHOD_ZSH_EVENT_EXEC_STARTED: &str = "zsh/event/execStarted";
 const METHOD_ZSH_EVENT_EXEC_STDOUT: &str = "zsh/event/execStdout";
 const METHOD_ZSH_EVENT_EXEC_STDERR: &str = "zsh/event/execStderr";
 const METHOD_ZSH_EVENT_EXEC_EXITED: &str = "zsh/event/execExited";
+const EXEC_WRAPPER_ENV_VAR: &str = "EXEC_WRAPPER";
+const SIDECAREXEC_WRAPPER_MODE_ENV_VAR: &str = "CODEX_ZSH_SIDECAR_WRAPPER_MODE";
+const SIDECAREXEC_WRAPPER_SOCKET_ENV_VAR: &str = "CODEX_ZSH_SIDECAR_WRAPPER_SOCKET";
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -164,17 +172,37 @@ struct ExecExitedEvent {
     timed_out: Option<bool>,
 }
 
-#[derive(Default)]
-struct SidecarState {
-    children: HashMap<String, Arc<Mutex<Child>>>,
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WrapperExecRequest {
+    file: String,
+    argv: Vec<String>,
+    cwd: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WrapperExecResponse {
+    action: WrapperExecAction,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum WrapperExecAction {
+    Run,
+    Deny,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if std::env::var_os(SIDECAREXEC_WRAPPER_MODE_ENV_VAR).is_some() {
+        return run_exec_wrapper_mode();
+    }
+
     tracing_subscriber::fmt().with_env_filter("warn").init();
     let args = Args::parse();
-    let state = Arc::new(Mutex::new(SidecarState::default()));
-    let stdout = Arc::new(Mutex::new(tokio::io::stdout()));
+    let mut stdout = tokio::io::stdout();
 
     let stdin = tokio::io::stdin();
     let mut lines = BufReader::new(stdin).lines();
@@ -215,7 +243,7 @@ async fn main() -> Result<()> {
         match method {
             METHOD_ZSH_INITIALIZE => {
                 write_json_line(
-                    &stdout,
+                    &mut stdout,
                     &JsonRpcSuccess {
                         jsonrpc: JSONRPC_VERSION,
                         id,
@@ -234,7 +262,7 @@ async fn main() -> Result<()> {
                     Ok(p) => p,
                     Err(message) => {
                         write_json_line(
-                            &stdout,
+                            &mut stdout,
                             &JsonRpcErrorResponse {
                                 jsonrpc: JSONRPC_VERSION,
                                 id,
@@ -251,7 +279,7 @@ async fn main() -> Result<()> {
 
                 if params.command.is_empty() {
                     write_json_line(
-                        &stdout,
+                        &mut stdout,
                         &JsonRpcErrorResponse {
                             jsonrpc: JSONRPC_VERSION,
                             id,
@@ -280,7 +308,7 @@ async fn main() -> Result<()> {
                         proposed_execpolicy_amendment: None,
                     },
                 };
-                write_json_line(&stdout, &approval_request).await?;
+                write_json_line(&mut stdout, &approval_request).await?;
 
                 let approval_decision =
                     wait_for_approval_result(&mut lines, approval_callback_id).await?;
@@ -290,7 +318,7 @@ async fn main() -> Result<()> {
                     | ApprovalDecision::ApprovedExecpolicyAmendment => {}
                     ApprovalDecision::Denied => {
                         write_json_line(
-                            &stdout,
+                            &mut stdout,
                             &JsonRpcErrorResponse {
                                 jsonrpc: JSONRPC_VERSION,
                                 id,
@@ -305,7 +333,7 @@ async fn main() -> Result<()> {
                     }
                     ApprovalDecision::Abort => {
                         write_json_line(
-                            &stdout,
+                            &mut stdout,
                             &JsonRpcErrorResponse {
                                 jsonrpc: JSONRPC_VERSION,
                                 id,
@@ -320,7 +348,7 @@ async fn main() -> Result<()> {
                     }
                 }
 
-                let mut cmd = tokio::process::Command::new(&params.command[0]);
+                let mut cmd = Command::new(&params.command[0]);
                 if params.command.len() > 1 {
                     cmd.args(&params.command[1..]);
                 }
@@ -334,12 +362,32 @@ async fn main() -> Result<()> {
                     cmd.envs(env);
                 }
                 cmd.env("CODEX_ZSH_PATH", &args.zsh_path);
+                #[cfg(unix)]
+                let wrapper_socket_path = {
+                    let socket_id = Uuid::new_v4().as_simple().to_string();
+                    std::env::temp_dir().join(format!("czs-{}.sock", &socket_id[..12]))
+                };
+                #[cfg(unix)]
+                {
+                    let _ = std::fs::remove_file(&wrapper_socket_path);
+                    cmd.env(
+                        SIDECAREXEC_WRAPPER_SOCKET_ENV_VAR,
+                        wrapper_socket_path.to_string_lossy().to_string(),
+                    );
+                    let wrapper_path =
+                        std::env::current_exe().context("resolve current sidecar binary path")?;
+                    cmd.env(
+                        EXEC_WRAPPER_ENV_VAR,
+                        wrapper_path.to_string_lossy().to_string(),
+                    );
+                }
+                cmd.env(SIDECAREXEC_WRAPPER_MODE_ENV_VAR, "1");
 
                 let mut child = match cmd.spawn() {
                     Ok(c) => c,
                     Err(err) => {
                         write_json_line(
-                            &stdout,
+                            &mut stdout,
                             &JsonRpcErrorResponse {
                                 jsonrpc: JSONRPC_VERSION,
                                 id,
@@ -354,18 +402,10 @@ async fn main() -> Result<()> {
                     }
                 };
 
-                let stdout_handle = child.stdout.take();
-                let stderr_handle = child.stderr.take();
                 let exec_id = params.exec_id.clone();
-                let child = Arc::new(Mutex::new(child));
-
-                {
-                    let mut st = state.lock().await;
-                    st.children.insert(exec_id.clone(), Arc::clone(&child));
-                }
 
                 write_json_line(
-                    &stdout,
+                    &mut stdout,
                     &JsonRpcSuccess {
                         jsonrpc: JSONRPC_VERSION,
                         id,
@@ -374,7 +414,7 @@ async fn main() -> Result<()> {
                 )
                 .await?;
                 write_json_line(
-                    &stdout,
+                    &mut stdout,
                     &JsonRpcNotification {
                         jsonrpc: JSONRPC_VERSION,
                         method: METHOD_ZSH_EVENT_EXEC_STARTED,
@@ -385,88 +425,152 @@ async fn main() -> Result<()> {
                 )
                 .await?;
 
-                if let Some(out) = stdout_handle {
-                    let stdout_writer = Arc::clone(&stdout);
-                    let stdout_exec_id = exec_id.clone();
-                    tokio::spawn(async move {
-                        stream_reader(
-                            stdout_exec_id,
-                            out,
-                            METHOD_ZSH_EVENT_EXEC_STDOUT,
-                            stdout_writer,
-                        )
-                        .await;
+                let mut tasks = JoinSet::new();
+                let (stream_tx, mut stream_rx) =
+                    mpsc::unbounded_channel::<(&'static str, Vec<u8>)>();
+                if let Some(mut out) = child.stdout.take() {
+                    let tx = stream_tx.clone();
+                    tasks.spawn(async move {
+                        let mut buf = [0_u8; 8192];
+                        loop {
+                            let read = match out.read(&mut buf).await {
+                                Ok(0) => break,
+                                Ok(n) => n,
+                                Err(err) => {
+                                    tracing::warn!("stdout read error: {err}");
+                                    break;
+                                }
+                            };
+                            let _ = tx.send((METHOD_ZSH_EVENT_EXEC_STDOUT, buf[..read].to_vec()));
+                        }
                     });
                 }
-
-                if let Some(err) = stderr_handle {
-                    let stderr_writer = Arc::clone(&stdout);
-                    let stderr_exec_id = exec_id.clone();
-                    tokio::spawn(async move {
-                        stream_reader(
-                            stderr_exec_id,
-                            err,
-                            METHOD_ZSH_EVENT_EXEC_STDERR,
-                            stderr_writer,
-                        )
-                        .await;
+                if let Some(mut err) = child.stderr.take() {
+                    let tx = stream_tx.clone();
+                    tasks.spawn(async move {
+                        let mut buf = [0_u8; 8192];
+                        loop {
+                            let read = match err.read(&mut buf).await {
+                                Ok(0) => break,
+                                Ok(n) => n,
+                                Err(err) => {
+                                    tracing::warn!("stderr read error: {err}");
+                                    break;
+                                }
+                            };
+                            let _ = tx.send((METHOD_ZSH_EVENT_EXEC_STDERR, buf[..read].to_vec()));
+                        }
                     });
                 }
+                drop(stream_tx);
 
-                let wait_writer = Arc::clone(&stdout);
-                let wait_state = Arc::clone(&state);
-                tokio::spawn(async move {
-                    let status = {
-                        let mut guard = child.lock().await;
-                        guard.wait().await
-                    };
+                #[cfg(unix)]
+                let listener = UnixListener::bind(&wrapper_socket_path).with_context(|| {
+                    format!("bind wrapper socket at {}", wrapper_socket_path.display())
+                })?;
 
-                    let (exit_code, signal) = match status {
-                        Ok(s) => {
-                            let code = s.code().unwrap_or(-1);
-                            #[cfg(unix)]
-                            {
-                                use std::os::unix::process::ExitStatusExt;
-                                (code, s.signal().map(|sig| sig.to_string()))
-                            }
-                            #[cfg(not(unix))]
-                            {
-                                (code, None)
+                let wait = child.wait();
+                tokio::pin!(wait);
+                let mut child_exit = None;
+
+                #[cfg(unix)]
+                while child_exit.is_none() || !stream_rx.is_closed() {
+                    tokio::select! {
+                        result = &mut wait, if child_exit.is_none() => {
+                            child_exit = Some(result.context("wait for command exit")?);
+                        }
+                        stream = stream_rx.recv(), if !stream_rx.is_closed() => {
+                            if let Some((method, chunk)) = stream {
+                                write_json_line(
+                                    &mut stdout,
+                                    &JsonRpcNotification {
+                                        jsonrpc: JSONRPC_VERSION,
+                                        method,
+                                        params: ExecChunkEvent {
+                                            exec_id: exec_id.clone(),
+                                            chunk_base64: base64::engine::general_purpose::STANDARD.encode(chunk),
+                                        },
+                                    }
+                                ).await?;
                             }
                         }
-                        Err(err) => {
-                            tracing::warn!("wait failed for exec {exec_id}: {err}");
-                            (-1, None)
+                        accept_result = listener.accept() => {
+                            let (stream, _) = match accept_result {
+                                Ok(pair) => pair,
+                                Err(err) => {
+                                    tracing::warn!("failed to accept wrapper request: {err}");
+                                    continue;
+                                }
+                            };
+                            handle_wrapper_request(
+                                &mut stdout,
+                                &mut lines,
+                                stream,
+                                exec_id.clone(),
+                            ).await?;
                         }
-                    };
-
-                    {
-                        let mut st = wait_state.lock().await;
-                        st.children.remove(&exec_id);
                     }
+                }
+                #[cfg(not(unix))]
+                while child_exit.is_none() || !stream_rx.is_closed() {
+                    tokio::select! {
+                        result = &mut wait, if child_exit.is_none() => {
+                            child_exit = Some(result.context("wait for command exit")?);
+                        }
+                        stream = stream_rx.recv(), if !stream_rx.is_closed() => {
+                            if let Some((method, chunk)) = stream {
+                                write_json_line(
+                                    &mut stdout,
+                                    &JsonRpcNotification {
+                                        jsonrpc: JSONRPC_VERSION,
+                                        method,
+                                        params: ExecChunkEvent {
+                                            exec_id: exec_id.clone(),
+                                            chunk_base64: base64::engine::general_purpose::STANDARD.encode(chunk),
+                                        },
+                                    }
+                                ).await?;
+                            }
+                        }
+                    }
+                }
 
-                    let _ = write_json_line(
-                        &wait_writer,
-                        &JsonRpcNotification {
-                            jsonrpc: JSONRPC_VERSION,
-                            method: METHOD_ZSH_EVENT_EXEC_EXITED,
-                            params: ExecExitedEvent {
-                                exec_id: exec_id.clone(),
-                                exit_code,
-                                signal,
-                                timed_out: Some(false),
-                            },
+                while tasks.join_next().await.is_some() {}
+                #[cfg(unix)]
+                {
+                    let _ = std::fs::remove_file(&wrapper_socket_path);
+                }
+
+                let status = child_exit.context("missing child exit status")?;
+                let exit_code = status.code().unwrap_or(-1);
+                #[cfg(unix)]
+                let signal = {
+                    use std::os::unix::process::ExitStatusExt;
+                    status.signal().map(|sig: i32| sig.to_string())
+                };
+                #[cfg(not(unix))]
+                let signal = None;
+                write_json_line(
+                    &mut stdout,
+                    &JsonRpcNotification {
+                        jsonrpc: JSONRPC_VERSION,
+                        method: METHOD_ZSH_EVENT_EXEC_EXITED,
+                        params: ExecExitedEvent {
+                            exec_id: exec_id.clone(),
+                            exit_code,
+                            signal,
+                            timed_out: Some(false),
                         },
-                    )
-                    .await;
-                });
+                    },
+                )
+                .await?;
             }
             METHOD_ZSH_EXEC_INTERRUPT => {
                 let params: ExecInterruptParams = match parse_params(&value) {
                     Ok(p) => p,
                     Err(message) => {
                         write_json_line(
-                            &stdout,
+                            &mut stdout,
                             &JsonRpcErrorResponse {
                                 jsonrpc: JSONRPC_VERSION,
                                 id,
@@ -480,47 +584,22 @@ async fn main() -> Result<()> {
                         continue;
                     }
                 };
-
-                let child = {
-                    let st = state.lock().await;
-                    st.children.get(&params.exec_id).cloned()
-                };
-
-                match child {
-                    Some(child) => {
-                        let mut guard = child.lock().await;
-                        if let Err(err) = guard.kill().await {
-                            tracing::warn!("failed to interrupt {}: {err}", params.exec_id);
-                        }
-                        write_json_line(
-                            &stdout,
-                            &JsonRpcSuccess {
-                                jsonrpc: JSONRPC_VERSION,
-                                id,
-                                result: EmptyResult {},
-                            },
-                        )
-                        .await?;
-                    }
-                    None => {
-                        write_json_line(
-                            &stdout,
-                            &JsonRpcErrorResponse {
-                                jsonrpc: JSONRPC_VERSION,
-                                id,
-                                error: JsonRpcError {
-                                    code: -32002,
-                                    message: format!("unknown exec id: {}", params.exec_id),
-                                },
-                            },
-                        )
-                        .await?;
-                    }
-                }
+                write_json_line(
+                    &mut stdout,
+                    &JsonRpcErrorResponse {
+                        jsonrpc: JSONRPC_VERSION,
+                        id,
+                        error: JsonRpcError {
+                            code: -32002,
+                            message: format!("unknown exec id: {}", params.exec_id),
+                        },
+                    },
+                )
+                .await?;
             }
             METHOD_ZSH_EXEC_STDIN | METHOD_ZSH_EXEC_RESIZE => {
                 write_json_line(
-                    &stdout,
+                    &mut stdout,
                     &JsonRpcErrorResponse {
                         jsonrpc: JSONRPC_VERSION,
                         id,
@@ -534,7 +613,7 @@ async fn main() -> Result<()> {
             }
             METHOD_ZSH_SHUTDOWN => {
                 write_json_line(
-                    &stdout,
+                    &mut stdout,
                     &JsonRpcSuccess {
                         jsonrpc: JSONRPC_VERSION,
                         id,
@@ -546,7 +625,7 @@ async fn main() -> Result<()> {
             }
             _ => {
                 write_json_line(
-                    &stdout,
+                    &mut stdout,
                     &JsonRpcErrorResponse {
                         jsonrpc: JSONRPC_VERSION,
                         id,
@@ -562,6 +641,76 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(unix)]
+fn run_exec_wrapper_mode() -> Result<()> {
+    use std::io::Read;
+    use std::io::Write;
+    use std::os::unix::net::UnixStream as StdUnixStream;
+
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() < 2 {
+        anyhow::bail!("exec wrapper mode requires target executable path");
+    }
+    let file = args[1].clone();
+    let argv = if args.len() > 2 {
+        args[2..].to_vec()
+    } else {
+        vec![file.clone()]
+    };
+    let cwd = std::env::current_dir()
+        .context("resolve wrapper cwd")?
+        .to_string_lossy()
+        .to_string();
+    let socket_path = std::env::var(SIDECAREXEC_WRAPPER_SOCKET_ENV_VAR)
+        .context("missing wrapper socket path env var")?;
+
+    let mut stream = StdUnixStream::connect(&socket_path)
+        .with_context(|| format!("connect to wrapper socket at {socket_path}"))?;
+    let request = WrapperExecRequest {
+        file: file.clone(),
+        argv: argv.clone(),
+        cwd,
+    };
+    let encoded = serde_json::to_string(&request).context("serialize wrapper request")?;
+    stream
+        .write_all(encoded.as_bytes())
+        .context("write wrapper request")?;
+    stream
+        .write_all(b"\n")
+        .context("write wrapper request newline")?;
+    stream
+        .shutdown(std::net::Shutdown::Write)
+        .context("shutdown wrapper write")?;
+
+    let mut response_buf = String::new();
+    stream
+        .read_to_string(&mut response_buf)
+        .context("read wrapper response")?;
+    let response: WrapperExecResponse =
+        serde_json::from_str(response_buf.trim()).context("parse wrapper response")?;
+
+    if response.action == WrapperExecAction::Deny {
+        if let Some(reason) = response.reason {
+            eprintln!("Execution denied: {reason}");
+        } else {
+            eprintln!("Execution denied");
+        }
+        std::process::exit(1);
+    }
+
+    let mut command = std::process::Command::new(&file);
+    if argv.len() > 1 {
+        command.args(&argv[1..]);
+    }
+    let status = command.status().context("spawn wrapped executable")?;
+    std::process::exit(status.code().unwrap_or(1));
+}
+
+#[cfg(not(unix))]
+fn run_exec_wrapper_mode() -> Result<()> {
+    anyhow::bail!("exec wrapper mode is only supported on unix");
 }
 
 async fn wait_for_approval_result(
@@ -607,40 +756,61 @@ async fn wait_for_approval_result(
     }
 }
 
-async fn stream_reader<R>(
+#[cfg(unix)]
+async fn handle_wrapper_request(
+    stdout: &mut tokio::io::Stdout,
+    lines: &mut tokio::io::Lines<BufReader<tokio::io::Stdin>>,
+    mut stream: UnixStream,
     exec_id: String,
-    mut reader: R,
-    method: &'static str,
-    writer: Arc<Mutex<tokio::io::Stdout>>,
-) where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    let mut buf = [0_u8; 8192];
+) -> Result<()> {
+    let mut request_buf = Vec::new();
+    stream
+        .read_to_end(&mut request_buf)
+        .await
+        .context("read wrapper request from socket")?;
+    let request_line = String::from_utf8(request_buf).context("decode wrapper request as utf-8")?;
+    let request: WrapperExecRequest =
+        serde_json::from_str(request_line.trim()).context("parse wrapper request payload")?;
 
-    loop {
-        let n = match reader.read(&mut buf).await {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(err) => {
-                tracing::warn!("read stream error for {exec_id}: {err}");
-                break;
-            }
-        };
-
-        let message = JsonRpcNotification {
-            jsonrpc: JSONRPC_VERSION,
-            method,
-            params: ExecChunkEvent {
-                exec_id: exec_id.clone(),
-                chunk_base64: base64::engine::general_purpose::STANDARD.encode(&buf[..n]),
+    let approval_callback_id =
+        JsonRpcId::String(format!("approval-{}-{}", exec_id, Uuid::new_v4()));
+    let approval_request = JsonRpcRequest {
+        jsonrpc: JSONRPC_VERSION,
+        id: approval_callback_id.clone(),
+        method: METHOD_ZSH_REQUEST_APPROVAL,
+        params: RequestApprovalParams {
+            approval_id: format!("approval-{}-{}", exec_id, Uuid::new_v4()),
+            exec_id: exec_id.clone(),
+            command: if request.argv.is_empty() {
+                vec![request.file.clone()]
+            } else {
+                request.argv.clone()
             },
-        };
+            cwd: request.cwd,
+            reason: "zsh sidecar intercepted subcommand execve".to_string(),
+            proposed_execpolicy_amendment: None,
+        },
+    };
+    write_json_line(stdout, &approval_request).await?;
+    let decision = wait_for_approval_result(lines, approval_callback_id).await?;
 
-        if let Err(err) = write_json_line(&writer, &message).await {
-            tracing::warn!("failed writing stream event for {exec_id}: {err}");
-            break;
-        }
-    }
+    let response = match decision {
+        ApprovalDecision::Approved
+        | ApprovalDecision::ApprovedForSession
+        | ApprovalDecision::ApprovedExecpolicyAmendment => WrapperExecResponse {
+            action: WrapperExecAction::Run,
+            reason: None,
+        },
+        ApprovalDecision::Denied => WrapperExecResponse {
+            action: WrapperExecAction::Deny,
+            reason: Some("command denied by host approval policy".to_string()),
+        },
+        ApprovalDecision::Abort => WrapperExecResponse {
+            action: WrapperExecAction::Deny,
+            reason: Some("command aborted by host approval policy".to_string()),
+        },
+    };
+    write_json_line(&mut stream, &response).await
 }
 
 fn parse_params<T: for<'de> Deserialize<'de>>(value: &JsonValue) -> std::result::Result<T, String> {
@@ -651,17 +821,16 @@ fn parse_params<T: for<'de> Deserialize<'de>>(value: &JsonValue) -> std::result:
     serde_json::from_value(params).map_err(|err| format!("invalid params: {err}"))
 }
 
-async fn write_json_line<T: Serialize>(
-    writer: &Arc<Mutex<tokio::io::Stdout>>,
+async fn write_json_line<W: tokio::io::AsyncWrite + Unpin, T: Serialize>(
+    writer: &mut W,
     message: &T,
 ) -> Result<()> {
     let encoded = serde_json::to_string(message).context("serialize JSON-RPC message")?;
-    let mut guard = writer.lock().await;
-    guard
+    writer
         .write_all(encoded.as_bytes())
         .await
         .context("write message")?;
-    guard.write_all(b"\n").await.context("write newline")?;
-    guard.flush().await.context("flush message")?;
+    writer.write_all(b"\n").await.context("write newline")?;
+    writer.flush().await.context("flush message")?;
     Ok(())
 }
