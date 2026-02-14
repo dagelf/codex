@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use crate::error::CodexErr;
 use crate::error::SandboxErr;
 use crate::exec::ExecToolCallOutput;
