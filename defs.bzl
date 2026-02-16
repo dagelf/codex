@@ -86,7 +86,7 @@ def codex_rust_crate(
     proc_macro_deps = all_crate_deps(proc_macro = True)
     proc_macro_dev_deps = all_crate_deps(proc_macro_dev = True)
 
-    test_env = {
+    lib_test_env = {
         "INSTA_WORKSPACE_ROOT": ".",
         "INSTA_SNAPSHOT_PATH": "src",
     }
@@ -94,6 +94,13 @@ def codex_rust_crate(
     rustc_env = {
         "BAZEL_PACKAGE": native.package_name(),
     } | rustc_env
+
+    package_segments = native.package_name().split("/") if native.package_name() else []
+    # Bazel test setup executes tests from:
+    #   <execroot>/_main/bazel-out/<config>/bin/<package>/test-<hash>/<name>.runfiles/_main
+    # For manifest-only runfiles (`--noenable_runfiles`), the source tree that insta needs
+    # lives at <execroot>/_main, so walk back from runfiles/_main to that location.
+    integration_workspace_root = "/".join([".."] * (len(package_segments) + 6))
 
     binaries = DEP_DATA.get(native.package_name())["binaries"]
 
@@ -132,7 +139,7 @@ def codex_rust_crate(
         rust_test(
             name = name + "-unit-tests",
             crate = name,
-            env = test_env,
+            env = lib_test_env,
             deps = deps + dev_deps,
             proc_macro_deps = proc_macro_deps + proc_macro_dev_deps,
             rustc_flags = rustc_flags_extra,
@@ -169,13 +176,19 @@ def codex_rust_crate(
         binary = Label(binary_label).name
         cargo_env["CARGO_BIN_EXE_" + binary] = "$(rlocationpath %s)" % binary_label
 
+    integration_test_env = cargo_env | {
+        "INSTA_WORKSPACE_ROOT": integration_workspace_root,
+    }
+
     for test in native.glob(["tests/*.rs"], allow_empty = True):
-        test_name = name + "-" + test.removeprefix("tests/").removesuffix(".rs").replace("/", "-")
+        test_crate_name = test.removeprefix("tests/").removesuffix(".rs")
+        test_name = name + "-" + test_crate_name.replace("/", "-")
         if not test_name.endswith("-test"):
             test_name += "-test"
 
         rust_test(
             name = test_name,
+            crate_name = test_crate_name,
             crate_root = test,
             srcs = [test],
             data = native.glob(["tests/**"], allow_empty = True) + sanitized_binaries + test_data_extra,
@@ -184,6 +197,6 @@ def codex_rust_crate(
             proc_macro_deps = proc_macro_deps + proc_macro_dev_deps,
             rustc_flags = rustc_flags_extra,
             rustc_env = rustc_env,
-            env = test_env | cargo_env,
+            env = integration_test_env,
             tags = test_tags,
         )
