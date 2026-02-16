@@ -181,8 +181,9 @@ def codex_rust_crate(
     }
 
     for test in native.glob(["tests/*.rs"], allow_empty = True):
-        test_crate_name = test.removeprefix("tests/").removesuffix(".rs")
-        test_name = name + "-" + test_crate_name.replace("/", "-")
+        test_file_stem = test.removeprefix("tests/").removesuffix(".rs")
+        test_crate_name = test_file_stem.replace("-", "_")
+        test_name = name + "-" + test_file_stem.replace("/", "-")
         if not test_name.endswith("-test"):
             test_name += "-test"
 
