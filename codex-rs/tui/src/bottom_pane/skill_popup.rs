@@ -25,6 +25,7 @@ pub(crate) struct MentionItem {
     pub(crate) search_terms: Vec<String>,
     pub(crate) path: Option<String>,
     pub(crate) category_tag: Option<String>,
+    pub(crate) sort_rank: u8,
 }
 
 const MENTION_NAME_TRUNCATE_LEN: usize = 24;
@@ -98,13 +99,26 @@ impl SkillPopup {
             .map(|(idx, indices, _score)| {
                 let mention = &self.mentions[idx];
                 let name = truncate_text(&mention.display_name, MENTION_NAME_TRUNCATE_LEN);
-                let description = mention.description.clone().unwrap_or_default();
+                let description = match (
+                    mention.category_tag.as_deref(),
+                    mention.description.as_deref(),
+                ) {
+                    (Some(tag), Some(description)) if !description.is_empty() => {
+                        Some(format!("{tag} {description}"))
+                    }
+                    (Some(tag), _) => Some(tag.to_string()),
+                    (None, Some(description)) if !description.is_empty() => {
+                        Some(description.to_string())
+                    }
+                    _ => None,
+                };
                 GenericDisplayRow {
                     name,
+                    name_prefix_spans: Vec::new(),
                     match_indices: indices,
                     display_shortcut: None,
-                    description: Some(description).filter(|desc| !desc.is_empty()),
-                    category_tag: mention.category_tag.clone(),
+                    description,
+                    category_tag: None,
                     is_disabled: false,
                     disabled_reason: None,
                     wrap_indent: None,
@@ -117,14 +131,12 @@ impl SkillPopup {
         let filter = self.query.trim();
         let mut out: Vec<(usize, Option<Vec<usize>>, i32)> = Vec::new();
 
-        if filter.is_empty() {
-            for (idx, _mention) in self.mentions.iter().enumerate() {
-                out.push((idx, None, 0));
-            }
-            return out;
-        }
-
         for (idx, mention) in self.mentions.iter().enumerate() {
+            if filter.is_empty() {
+                out.push((idx, None, 0));
+                continue;
+            }
+
             let mut best_match: Option<(Option<Vec<usize>>, i32)> = None;
 
             if let Some((indices, score)) = fuzzy_match(&mention.display_name, filter) {
@@ -157,11 +169,15 @@ impl SkillPopup {
         }
 
         out.sort_by(|a, b| {
-            a.2.cmp(&b.2).then_with(|| {
-                let an = self.mentions[a.0].display_name.as_str();
-                let bn = self.mentions[b.0].display_name.as_str();
-                an.cmp(bn)
-            })
+            self.mentions[a.0]
+                .sort_rank
+                .cmp(&self.mentions[b.0].sort_rank)
+                .then_with(|| a.2.cmp(&b.2))
+                .then_with(|| {
+                    let an = self.mentions[a.0].display_name.as_str();
+                    let bn = self.mentions[b.0].display_name.as_str();
+                    an.cmp(bn)
+                })
         });
 
         out
@@ -183,7 +199,9 @@ impl WidgetRef for SkillPopup {
         };
         let rows = self.rows_from_matches(self.filtered());
         render_rows_single_line(
-            list_area.inset(Insets::tlbr(0, 2, 0, 0)),
+            list_area.inset(Insets::tlbr(
+                /*top*/ 0, /*left*/ 2, /*bottom*/ 0, /*right*/ 0,
+            )),
             buf,
             &rows,
             &self.state,
@@ -210,4 +228,64 @@ fn skill_popup_hint_line() -> Line<'static> {
         key_hint::plain(KeyCode::Esc).into(),
         " to close".into(),
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+
+    fn mention_item(index: usize) -> MentionItem {
+        MentionItem {
+            display_name: format!("Mention {index:02}"),
+            description: Some(format!("Description {index:02}")),
+            insert_text: format!("$mention-{index:02}"),
+            search_terms: vec![format!("mention-{index:02}")],
+            path: Some(format!("skill://mention-{index:02}")),
+            category_tag: Some("[Skill]".to_string()),
+            sort_rank: 1,
+        }
+    }
+
+    #[test]
+    fn filtered_mentions_preserve_results_beyond_popup_height() {
+        let popup = SkillPopup::new((0..(MAX_POPUP_ROWS + 2)).map(mention_item).collect());
+
+        let filtered_names: Vec<String> = popup
+            .filtered_items()
+            .into_iter()
+            .map(|idx| popup.mentions[idx].display_name.clone())
+            .collect();
+
+        assert_eq!(
+            filtered_names,
+            (0..(MAX_POPUP_ROWS + 2))
+                .map(|idx| format!("Mention {idx:02}"))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            popup.calculate_required_height(72),
+            (MAX_POPUP_ROWS as u16) + 2
+        );
+    }
+
+    fn render_popup(popup: &SkillPopup, width: u16) -> String {
+        let area = Rect::new(0, 0, width, popup.calculate_required_height(width));
+        let mut buf = Buffer::empty(area);
+        popup.render_ref(area, &mut buf);
+        format!("{buf:?}")
+    }
+
+    #[test]
+    fn scrolling_mentions_shifts_rendered_window_snapshot() {
+        let mut popup = SkillPopup::new((0..(MAX_POPUP_ROWS + 2)).map(mention_item).collect());
+
+        for _ in 0..=MAX_POPUP_ROWS {
+            popup.move_down();
+        }
+
+        insta::assert_snapshot!("skill_popup_scrolled", render_popup(&popup, /*width*/ 72));
+    }
 }

@@ -7,14 +7,14 @@ use chrono::DateTime;
 use chrono::Local;
 use codex_core::WireApi;
 use codex_core::config::Config;
-use codex_core::protocol::AskForApproval;
-use codex_core::protocol::NetworkAccess;
-use codex_core::protocol::SandboxPolicy;
-use codex_core::protocol::TokenUsage;
-use codex_core::protocol::TokenUsageInfo;
 use codex_protocol::ThreadId;
 use codex_protocol::account::PlanType;
 use codex_protocol::openai_models::ReasoningEffort;
+use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::NetworkAccess;
+use codex_protocol::protocol::SandboxPolicy;
+use codex_protocol::protocol::TokenUsage;
+use codex_protocol::protocol::TokenUsageInfo;
 use codex_utils_sandbox_summary::summarize_sandbox_policy;
 use ratatui::prelude::*;
 use ratatui::style::Stylize;
@@ -41,8 +41,7 @@ use super::rate_limits::compose_rate_limit_data_many;
 use super::rate_limits::format_status_limit_summary;
 use super::rate_limits::render_status_limit_progress_bar;
 use crate::wrapping::RtOptions;
-use crate::wrapping::word_wrap_lines;
-use codex_core::AuthManager;
+use crate::wrapping::adaptive_wrap_lines;
 
 #[derive(Debug, Clone)]
 struct StatusContextWindowData {
@@ -80,14 +79,14 @@ struct StatusHistoryCell {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn new_status_output(
     config: &Config,
-    auth_manager: &AuthManager,
+    account_display: Option<&StatusAccountDisplay>,
     token_info: Option<&TokenUsageInfo>,
     total_usage: &TokenUsage,
     session_id: &Option<ThreadId>,
     thread_name: Option<String>,
     forked_from: Option<ThreadId>,
     rate_limits: Option<&RateLimitSnapshotDisplay>,
-    plan_type: Option<PlanType>,
+    _plan_type: Option<PlanType>,
     now: DateTime<Local>,
     model_name: &str,
     collaboration_mode: Option<&str>,
@@ -96,14 +95,14 @@ pub(crate) fn new_status_output(
     let snapshots = rate_limits.map(std::slice::from_ref).unwrap_or_default();
     new_status_output_with_rate_limits(
         config,
-        auth_manager,
+        account_display,
         token_info,
         total_usage,
         session_id,
         thread_name,
         forked_from,
         snapshots,
-        plan_type,
+        _plan_type,
         now,
         model_name,
         collaboration_mode,
@@ -114,14 +113,14 @@ pub(crate) fn new_status_output(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn new_status_output_with_rate_limits(
     config: &Config,
-    auth_manager: &AuthManager,
+    account_display: Option<&StatusAccountDisplay>,
     token_info: Option<&TokenUsageInfo>,
     total_usage: &TokenUsage,
     session_id: &Option<ThreadId>,
     thread_name: Option<String>,
     forked_from: Option<ThreadId>,
     rate_limits: &[RateLimitSnapshotDisplay],
-    plan_type: Option<PlanType>,
+    _plan_type: Option<PlanType>,
     now: DateTime<Local>,
     model_name: &str,
     collaboration_mode: Option<&str>,
@@ -130,14 +129,14 @@ pub(crate) fn new_status_output_with_rate_limits(
     let command = PlainHistoryCell::new(vec!["/status".magenta().into()]);
     let card = StatusHistoryCell::new(
         config,
-        auth_manager,
+        account_display,
         token_info,
         total_usage,
         session_id,
         thread_name,
         forked_from,
         rate_limits,
-        plan_type,
+        _plan_type,
         now,
         model_name,
         collaboration_mode,
@@ -151,14 +150,14 @@ impl StatusHistoryCell {
     #[allow(clippy::too_many_arguments)]
     fn new(
         config: &Config,
-        auth_manager: &AuthManager,
+        account_display: Option<&StatusAccountDisplay>,
         token_info: Option<&TokenUsageInfo>,
         total_usage: &TokenUsage,
         session_id: &Option<ThreadId>,
         thread_name: Option<String>,
         forked_from: Option<ThreadId>,
         rate_limits: &[RateLimitSnapshotDisplay],
-        plan_type: Option<PlanType>,
+        _plan_type: Option<PlanType>,
         now: DateTime<Local>,
         model_name: &str,
         collaboration_mode: Option<&str>,
@@ -185,7 +184,10 @@ impl StatusHistoryCell {
             config_entries.push(("reasoning effort", effort_value));
             config_entries.push((
                 "reasoning summaries",
-                config.model_reasoning_summary.to_string(),
+                config
+                    .model_reasoning_summary
+                    .map(|summary| summary.to_string())
+                    .unwrap_or_else(|| "auto".to_string()),
             ));
         }
         let (model_name, model_details) = compose_model_display(model_name, &config_entries);
@@ -224,7 +226,7 @@ impl StatusHistoryCell {
         };
         let agents_summary = compose_agents_summary(config);
         let model_provider = format_model_provider(config);
-        let account = compose_account_display(auth_manager, plan_type);
+        let account = compose_account_display(account_display);
         let session_id = session_id.as_ref().map(std::string::ToString::to_string);
         let forked_from = forked_from.map(|id| id.to_string());
         let default_usage = TokenUsage::default();
@@ -253,7 +255,7 @@ impl StatusHistoryCell {
         Self {
             model_name,
             model_details,
-            directory: config.cwd.clone(),
+            directory: config.cwd.to_path_buf(),
             permissions,
             agents_summary,
             collaboration_mode: collaboration_mode.map(ToString::to_string),
@@ -479,7 +481,7 @@ impl HistoryCell for StatusHistoryCell {
         let note_second_line = Line::from(vec![
             Span::from("information on rate limits and credits").cyan(),
         ]);
-        let note_lines = word_wrap_lines(
+        let note_lines = adaptive_wrap_lines(
             [note_first_line, note_second_line],
             RtOptions::new(available_inner_width),
         );

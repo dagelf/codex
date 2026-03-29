@@ -2,17 +2,17 @@ use std::process::Command;
 use std::sync::Arc;
 
 use codex_core::CodexAuth;
-use codex_core::ContentItem;
 use codex_core::ModelClient;
 use codex_core::ModelProviderInfo;
 use codex_core::Prompt;
 use codex_core::ResponseEvent;
-use codex_core::ResponseItem;
 use codex_core::WireApi;
-use codex_otel::OtelManager;
+use codex_otel::SessionTelemetry;
 use codex_otel::TelemetryAuthMode;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::ReasoningSummary;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use core_test_support::load_default_config_for_test;
@@ -53,6 +53,7 @@ async fn responses_stream_includes_subagent_header_on_review() {
         request_max_retries: Some(0),
         stream_max_retries: Some(0),
         stream_idle_timeout_ms: Some(5_000),
+        websocket_connect_timeout_ms: None,
         requires_openai_auth: false,
         supports_websockets: false,
     };
@@ -72,30 +73,28 @@ async fn responses_stream_includes_subagent_header_on_review() {
     let session_source = SessionSource::SubAgent(SubAgentSource::Review);
     let model_info =
         codex_core::test_support::construct_model_info_offline(model.as_str(), &config);
-    let otel_manager = OtelManager::new(
+    let session_telemetry = SessionTelemetry::new(
         conversation_id,
         model.as_str(),
         model_info.slug.as_str(),
-        None,
+        /*account_id*/ None,
         Some("test@test.com".to_string()),
         Some(auth_mode),
         "test_originator".to_string(),
-        false,
+        /*log_user_prompts*/ false,
         "test".to_string(),
         session_source.clone(),
     );
 
     let client = ModelClient::new(
-        None,
+        /*auth_manager*/ None,
         conversation_id,
         provider.clone(),
         session_source,
         config.model_verbosity,
-        false,
-        false,
-        false,
-        false,
-        None,
+        /*enable_request_compression*/ false,
+        /*include_timing_metrics*/ false,
+        /*beta_features_header*/ None,
     );
     let mut client_session = client.new_session();
 
@@ -111,7 +110,15 @@ async fn responses_stream_includes_subagent_header_on_review() {
     }];
 
     let mut stream = client_session
-        .stream(&prompt, &model_info, &otel_manager, effort, summary, None)
+        .stream(
+            &prompt,
+            &model_info,
+            &session_telemetry,
+            effort,
+            summary.unwrap_or(model_info.default_reasoning_summary),
+            /*service_tier*/ None,
+            /*turn_metadata_header*/ None,
+        )
         .await
         .expect("stream failed");
     while let Some(event) = stream.next().await {
@@ -158,6 +165,7 @@ async fn responses_stream_includes_subagent_header_on_other() {
         request_max_retries: Some(0),
         stream_max_retries: Some(0),
         stream_idle_timeout_ms: Some(5_000),
+        websocket_connect_timeout_ms: None,
         requires_openai_auth: false,
         supports_websockets: false,
     };
@@ -178,30 +186,28 @@ async fn responses_stream_includes_subagent_header_on_other() {
     let model_info =
         codex_core::test_support::construct_model_info_offline(model.as_str(), &config);
 
-    let otel_manager = OtelManager::new(
+    let session_telemetry = SessionTelemetry::new(
         conversation_id,
         model.as_str(),
         model_info.slug.as_str(),
-        None,
+        /*account_id*/ None,
         Some("test@test.com".to_string()),
         Some(auth_mode),
         "test_originator".to_string(),
-        false,
+        /*log_user_prompts*/ false,
         "test".to_string(),
         session_source.clone(),
     );
 
     let client = ModelClient::new(
-        None,
+        /*auth_manager*/ None,
         conversation_id,
         provider.clone(),
         session_source,
         config.model_verbosity,
-        false,
-        false,
-        false,
-        false,
-        None,
+        /*enable_request_compression*/ false,
+        /*include_timing_metrics*/ false,
+        /*beta_features_header*/ None,
     );
     let mut client_session = client.new_session();
 
@@ -217,7 +223,15 @@ async fn responses_stream_includes_subagent_header_on_other() {
     }];
 
     let mut stream = client_session
-        .stream(&prompt, &model_info, &otel_manager, effort, summary, None)
+        .stream(
+            &prompt,
+            &model_info,
+            &session_telemetry,
+            effort,
+            summary.unwrap_or(model_info.default_reasoning_summary),
+            /*service_tier*/ None,
+            /*turn_metadata_header*/ None,
+        )
         .await
         .expect("stream failed");
     while let Some(event) = stream.next().await {
@@ -258,6 +272,7 @@ async fn responses_respects_model_info_overrides_from_config() {
         request_max_retries: Some(0),
         stream_max_retries: Some(0),
         stream_idle_timeout_ms: Some(5_000),
+        websocket_connect_timeout_ms: None,
         requires_openai_auth: false,
         supports_websockets: false,
     };
@@ -268,7 +283,7 @@ async fn responses_respects_model_info_overrides_from_config() {
     config.model_provider_id = provider.name.clone();
     config.model_provider = provider.clone();
     config.model_supports_reasoning_summaries = Some(true);
-    config.model_reasoning_summary = ReasoningSummary::Detailed;
+    config.model_reasoning_summary = Some(ReasoningSummary::Detailed);
     let effort = config.model_reasoning_effort;
     let summary = config.model_reasoning_summary;
     let model = config.model.clone().expect("model configured");
@@ -283,30 +298,28 @@ async fn responses_respects_model_info_overrides_from_config() {
         SessionSource::SubAgent(SubAgentSource::Other("override-check".to_string()));
     let model_info =
         codex_core::test_support::construct_model_info_offline(model.as_str(), &config);
-    let otel_manager = OtelManager::new(
+    let session_telemetry = SessionTelemetry::new(
         conversation_id,
         model.as_str(),
         model_info.slug.as_str(),
-        None,
+        /*account_id*/ None,
         Some("test@test.com".to_string()),
         auth_mode,
         "test_originator".to_string(),
-        false,
+        /*log_user_prompts*/ false,
         "test".to_string(),
         session_source.clone(),
     );
 
     let client = ModelClient::new(
-        None,
+        /*auth_manager*/ None,
         conversation_id,
         provider.clone(),
         session_source,
         config.model_verbosity,
-        false,
-        false,
-        false,
-        false,
-        None,
+        /*enable_request_compression*/ false,
+        /*include_timing_metrics*/ false,
+        /*beta_features_header*/ None,
     );
     let mut client_session = client.new_session();
 
@@ -322,7 +335,15 @@ async fn responses_respects_model_info_overrides_from_config() {
     }];
 
     let mut stream = client_session
-        .stream(&prompt, &model_info, &otel_manager, effort, summary, None)
+        .stream(
+            &prompt,
+            &model_info,
+            &session_telemetry,
+            effort,
+            summary.unwrap_or(model_info.default_reasoning_summary),
+            /*service_tier*/ None,
+            /*turn_metadata_header*/ None,
+        )
         .await
         .expect("stream failed");
     while let Some(event) = stream.next().await {
