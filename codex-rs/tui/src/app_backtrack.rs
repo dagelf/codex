@@ -251,11 +251,9 @@ impl App {
     /// Re-render the full transcript into the terminal scrollback in one call.
     /// Useful when switching sessions to ensure prior history remains visible.
     pub(crate) fn render_transcript_once(&mut self, tui: &mut tui::Tui) {
-        if !self.transcript_cells.is_empty() {
-            let width = tui.terminal.last_known_screen_size.width;
-            for cell in &self.transcript_cells {
-                tui.insert_history_lines(cell.display_lines(width));
-            }
+        let lines = self.transcript_scrollback_lines(tui.terminal.last_known_screen_size.width);
+        if !lines.is_empty() {
+            tui.insert_history_lines(lines);
         }
     }
 

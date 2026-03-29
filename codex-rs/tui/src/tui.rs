@@ -244,6 +244,7 @@ pub struct Tui {
     event_broker: Arc<EventBroker>,
     pub(crate) terminal: Terminal,
     pending_history_lines: Vec<Line<'static>>,
+    skip_pending_viewport_adjustment_once: bool,
     alt_saved_viewport: Option<ratatui::layout::Rect>,
     #[cfg(unix)]
     suspend_context: SuspendContext,
@@ -275,6 +276,7 @@ impl Tui {
             event_broker: Arc::new(EventBroker::new()),
             terminal,
             pending_history_lines: vec![],
+            skip_pending_viewport_adjustment_once: false,
             alt_saved_viewport: None,
             #[cfg(unix)]
             suspend_context: SuspendContext::new(),
@@ -449,6 +451,10 @@ impl Tui {
         self.pending_history_lines.clear();
     }
 
+    pub fn skip_pending_viewport_adjustment_once(&mut self) {
+        self.skip_pending_viewport_adjustment_once = true;
+    }
+
     pub fn draw(
         &mut self,
         height: u16,
@@ -523,6 +529,10 @@ impl Tui {
     }
 
     fn pending_viewport_area(&mut self) -> Result<Option<Rect>> {
+        if self.skip_pending_viewport_adjustment_once {
+            self.skip_pending_viewport_adjustment_once = false;
+            return Ok(None);
+        }
         let terminal = &mut self.terminal;
         let screen_size = terminal.size()?;
         let last_known_screen_size = terminal.last_known_screen_size;

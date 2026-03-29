@@ -1466,6 +1466,60 @@ impl App {
         }
     }
 
+    pub(crate) fn transcript_scrollback_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let mut rendered = Vec::new();
+        let mut has_emitted_lines = false;
+
+        let mut append_cell = |cell: &Arc<dyn HistoryCell>| {
+            let mut display = cell.display_lines(width);
+            if display.is_empty() {
+                return;
+            }
+
+            if !cell.is_stream_continuation() {
+                if has_emitted_lines {
+                    display.insert(0, Line::from(""));
+                } else {
+                    has_emitted_lines = true;
+                }
+            }
+
+            rendered.extend(display);
+        };
+
+        for cell in &self.transcript_cells {
+            append_cell(cell);
+        }
+
+        if let Some(mut tail) = self.chat_widget.active_cell_transcript_lines(width) {
+            let is_stream_continuation = self
+                .chat_widget
+                .active_cell_transcript_key()
+                .is_some_and(|key| key.is_stream_continuation);
+            if !is_stream_continuation && has_emitted_lines {
+                tail.insert(0, Line::from(""));
+            }
+            rendered.extend(tail);
+        }
+
+        rendered
+    }
+
+    fn repaint_transcript_scrollback_for_width(
+        &mut self,
+        tui: &mut tui::Tui,
+        width: u16,
+    ) -> Result<()> {
+        self.clear_terminal_ui(tui, /*redraw_header*/ false)?;
+        tui.skip_pending_viewport_adjustment_once();
+        let lines = self.transcript_scrollback_lines(width);
+        if !lines.is_empty() {
+            self.has_emitted_history_lines = true;
+            tui.insert_history_lines(lines);
+        }
+        Ok(())
+    }
+
     fn clear_terminal_ui(&mut self, tui: &mut tui::Tui, redraw_header: bool) -> Result<()> {
         let is_alt_screen_active = tui.is_alt_screen_active();
 
@@ -3581,6 +3635,9 @@ impl App {
             let size = tui.terminal.size()?;
             if size != tui.terminal.last_known_screen_size {
                 self.refresh_status_line();
+                if self.overlay.is_none() {
+                    self.repaint_transcript_scrollback_for_width(tui, size.width)?;
+                }
             }
         }
 
@@ -5842,6 +5899,22 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use tempfile::tempdir;
     use tokio::time;
+
+    fn user_history_cell(message: &str) -> Arc<dyn HistoryCell> {
+        Arc::new(history_cell::new_user_prompt(
+            message.to_string(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ))
+    }
+
+    fn agent_history_cell(message: &str, is_first_line: bool) -> Arc<dyn HistoryCell> {
+        Arc::new(AgentMessageCell::new(
+            vec![Line::from(message.to_string())],
+            is_first_line,
+        ))
+    }
 
     #[test]
     fn normalize_harness_overrides_resolves_relative_add_dirs() -> Result<()> {
@@ -8804,6 +8877,24 @@ guardian_approval = true
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[tokio::test]
+    async fn transcript_scrollback_lines_preserve_cell_spacing() {
+        let mut app = make_test_app().await;
+        app.transcript_cells = vec![
+            user_history_cell("first question"),
+            agent_history_cell("first answer", /*is_first_line*/ true),
+            agent_history_cell("continued answer", /*is_first_line*/ false),
+            user_history_cell("second question"),
+        ];
+
+        let rendered = lines_to_single_string(&app.transcript_scrollback_lines(/*width*/ 80));
+
+        assert_snapshot!(
+            "transcript_scrollback_lines_preserve_cell_spacing",
+            rendered
+        );
     }
 
     fn test_session_telemetry(config: &Config, model: &str) -> SessionTelemetry {
