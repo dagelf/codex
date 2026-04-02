@@ -1,0 +1,14 @@
+---
+source: tui/src/app.rs
+assertion_line: 8894
+expression: rendered
+---
+
+› first question
+
+
+• first answer
+  continued answer
+
+
+› second question

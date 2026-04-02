@@ -242,6 +242,7 @@ pub struct Tui {
     event_broker: Arc<EventBroker>,
     pub(crate) terminal: Terminal,
     pending_history_lines: Vec<Line<'static>>,
+    skip_pending_viewport_adjustment_once: bool,
     alt_saved_viewport: Option<ratatui::layout::Rect>,
     #[cfg(unix)]
     suspend_context: SuspendContext,
@@ -273,6 +274,7 @@ impl Tui {
             event_broker: Arc::new(EventBroker::new()),
             terminal,
             pending_history_lines: vec![],
+            skip_pending_viewport_adjustment_once: false,
             alt_saved_viewport: None,
             #[cfg(unix)]
             suspend_context: SuspendContext::new(),
@@ -447,6 +449,10 @@ impl Tui {
         self.pending_history_lines.clear();
     }
 
+    pub fn skip_pending_viewport_adjustment_once(&mut self) {
+        self.skip_pending_viewport_adjustment_once = true;
+    }
+
     pub fn draw(
         &mut self,
         height: u16,
@@ -510,5 +516,31 @@ impl Tui {
                 draw_fn(frame);
             })
         })?
+    }
+
+    fn pending_viewport_area(&mut self) -> Result<Option<Rect>> {
+        if self.skip_pending_viewport_adjustment_once {
+            self.skip_pending_viewport_adjustment_once = false;
+            return Ok(None);
+        }
+        let terminal = &mut self.terminal;
+        let screen_size = terminal.size()?;
+        let last_known_screen_size = terminal.last_known_screen_size;
+        if screen_size != last_known_screen_size
+            && let Ok(cursor_pos) = terminal.get_cursor_position()
+        {
+            let last_known_cursor_pos = terminal.last_known_cursor_pos;
+            // If we resized AND the cursor moved, we adjust the viewport area to keep the
+            // cursor in the same position. This is a heuristic that seems to work well
+            // at least in iTerm2.
+            if cursor_pos.y != last_known_cursor_pos.y {
+                let offset = Offset {
+                    x: 0,
+                    y: cursor_pos.y as i32 - last_known_cursor_pos.y as i32,
+                };
+                return Ok(Some(terminal.viewport_area.offset(offset)));
+            }
+        }
+        Ok(None)
     }
 }
