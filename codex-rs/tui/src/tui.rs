@@ -30,8 +30,6 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::disable_raw_mode;
 use ratatui::crossterm::terminal::enable_raw_mode;
-use ratatui::layout::Offset;
-use ratatui::layout::Rect;
 use ratatui::text::Line;
 use tokio::sync::broadcast;
 use tokio_stream::Stream;
@@ -467,10 +465,6 @@ impl Tui {
             .suspend_context
             .prepare_resume_action(&mut self.terminal, &mut self.alt_saved_viewport);
 
-        // Precompute any viewport updates that need a cursor-position query before entering
-        // the synchronized update, to avoid racing with the event reader.
-        let mut pending_viewport_area = self.pending_viewport_area()?;
-
         stdout().sync_update(|_| {
             #[cfg(unix)]
             if let Some(prepared) = prepared_resume.take() {
@@ -478,10 +472,6 @@ impl Tui {
             }
 
             let terminal = &mut self.terminal;
-            if let Some(new_area) = pending_viewport_area.take() {
-                terminal.set_viewport_area(new_area);
-                terminal.clear()?;
-            }
 
             let size = terminal.size()?;
 
